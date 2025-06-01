@@ -6,6 +6,11 @@ Adds GAE for low-variance advantage estimation.
 
 from typing import Any, List, Tuple
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+import json
+
 import gymnasium as gym
 import hydra
 import numpy as np
@@ -163,15 +168,20 @@ class ActorCriticAgent(AbstractAgent):
             Discounted returns.
         """
         # TODO: convert rewards into discounted returns
+        returns = self.compute_returns(rewards)
 
         # TODO: convert states list into a torch batch and compute state-values
+        states = torch.tensor(np.array(states))
+        values = self.value_fn(states).squeeze(-1)
 
         # TODO: compute raw advantages = returns - values
+        raw_adv: torch.Tensor = returns - values
 
         # TODO: normalize advantages to zero mean and unit variance and use 1e-8 for numerical stability
+        adv = (raw_adv - raw_adv.mean()) / (raw_adv.std(unbiased=False) + 1e-8)
 
         # return normalized advantages and returns
-        return None
+        return adv, returns
 
     def compute_gae(
         self,
@@ -203,18 +213,34 @@ class ActorCriticAgent(AbstractAgent):
         """
 
         # TODO: compute values and next_values using your value_fn
+        states = torch.tensor(np.array(states))
+        next_states = torch.tensor(np.array(next_states))
+        rewards = torch.tensor(rewards)
+        dones = torch.tensor(dones, dtype=torch.int)
+        
+        values = self.value_fn(states).squeeze(-1)
+        next_values = self.value_fn(next_states).squeeze(-1)
 
         # TODO: compute deltas: one-step TD errors
+        # 𝛿𝑡 = 𝑟𝑡 + 𝛾𝑉 𝜋(𝑠𝑡+1) − 𝑉 𝜋(𝑠𝑡)
+        deltas = rewards + self.gamma * next_values * (1 - dones) - values
 
         # TODO: accumulate GAE advantages backwards
+        adv = torch.zeros_like(deltas)
+        gae = 0
+        for i in reversed(range(len(deltas))):
+            gae = deltas[i] + self.gamma * self.gae_lambda * (1 - dones[i]) * gae
+            adv[i] = gae
 
         # TODO: compute returns using advantages and values
+        returns: torch.Tensor = adv + values
 
         # TODO: normalize advantages to zero mean and unit variance and use 1e-8 for numerical stability
+        adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
         # TODO: advantages, returns  # replace with actual values (detach both to avoid re-entering the graph)
 
-        return None
+        return adv.detach(), returns.detach()
 
     def update_agent(
         self,
@@ -250,13 +276,16 @@ class ActorCriticAgent(AbstractAgent):
             ret = self.compute_returns(list(rewards))
 
             # TODO: compute advantages by subtracting running return
-            adv = ...
+            self.running_return = ret.mean().item()
+            adv = ret - self.running_return
 
             # TODO: normalize advantages to zero mean and unit variance and use 1e-8 for numerical stability
             # (Reminder, use unbiased=False for torch tensors)
+            adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
 
             # TODO: update running return using baseline decay
             # (x = baseline_decay * x + (1 - baseline_decay) * mean return)
+            self.running_return = self.baseline_decay * self.running_return + (1 - self.baseline_decay) * ret.mean().item()
         else:
             ret = self.compute_returns(list(rewards))
             adv = (ret - ret.mean()) / (ret.std(unbiased=False) + 1e-8)
@@ -273,7 +302,7 @@ class ActorCriticAgent(AbstractAgent):
         if self.baseline_type in ("value", "gae"):
             vals = self.value_fn(
                 torch.stack([torch.from_numpy(s).float() for s in states])
-            )
+            ).squeeze(-1)
             value_loss = F.mse_loss(vals, ret)
             self.value_optimizer.zero_grad()
             if value_loss.requires_grad:
@@ -342,6 +371,9 @@ class ActorCriticAgent(AbstractAgent):
         """
         eval_env = gym.make(self.env.spec.id)
         step_count = 0
+        avg_returns = list()
+        std_returns = list()
+        steps = list()
 
         while step_count < total_steps:
             state, _ = self.env.reset()
@@ -363,6 +395,9 @@ class ActorCriticAgent(AbstractAgent):
                     print(
                         f"[Eval ] Step {step_count:6d} AvgReturn {mean_r:5.1f} ± {std_r:4.1f}"
                     )
+                    avg_returns.append(mean_r)
+                    std_returns.append(std_r)
+                    steps.append(step_count)
 
             policy_loss, value_loss = self.update_agent(trajectory)
             total_return = sum(r for _, _, r, *_ in trajectory)
@@ -371,30 +406,42 @@ class ActorCriticAgent(AbstractAgent):
             )
 
         print("Training complete.")
+        return avg_returns, std_returns, steps
 
 
 @hydra.main(
     config_path="../configs/agent/", config_name="actor-critic", version_base="1.1"
 )
 def main(cfg: DictConfig) -> None:
-    env = gym.make(cfg.env.name)
-    set_seed(env, cfg.seed)
-    agent = ActorCriticAgent(
-        env,
-        lr_actor=cfg.agent.lr_actor,
-        lr_critic=cfg.agent.lr_critic,
-        gamma=cfg.agent.gamma,
-        gae_lambda=cfg.agent.get("gae_lambda", 0.95),  # FIXME
-        seed=cfg.seed,
-        hidden_size=cfg.agent.hidden_size,
-        baseline_type=cfg.agent.baseline_type,
-        baseline_decay=cfg.agent.get("baseline_decay", 0.9),
-    )
-    agent.train(
-        cfg.train.total_steps,
-        cfg.train.eval_interval,
-        cfg.train.eval_episodes,
-    )
+    for seed in [123, 456789, 34643]:
+        # env = gym.make(cfg.env.name)
+        env = gym.make(cfg.env.name, render_mode="human")
+        set_seed(env, seed)  # cfg.seed
+        agent = ActorCriticAgent(
+            env,
+            lr_actor=cfg.agent.lr_actor,
+            lr_critic=cfg.agent.lr_critic,
+            gamma=cfg.agent.gamma,
+            gae_lambda=cfg.agent.get("gae_lambda", 0.95),  # FIXME
+            seed=seed,  # cfg.seed
+            hidden_size=cfg.agent.hidden_size,
+            baseline_type=cfg.agent.baseline_type,
+            baseline_decay=cfg.agent.get("baseline_decay", 0.9),
+        )
+        avg_returns, std_returns, steps = agent.train(
+            cfg.train.total_steps,
+            cfg.train.eval_interval,
+            cfg.train.eval_episodes,
+        )
+
+        if False:
+            data = {
+                'avg_returns': avg_returns,
+                'std_returns': std_returns,
+                'steps': steps
+            }
+            with open(f"../../../rl_exercises/week_6/results/level_1/baseline_{cfg.agent.baseline_type}_{seed}.json", 'w') as file:
+                json.dump(data, file)
 
 
 if __name__ == "__main__":

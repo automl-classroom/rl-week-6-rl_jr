@@ -6,6 +6,10 @@ value-loss coefficient, and entropy bonus, trained for a total number of environ
 
 from typing import Any, List, Tuple
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -173,7 +177,29 @@ class PPOAgent(AbstractAgent):
             Value targets for training the critic.
         """
         # TODO: compute advantages using GAE (Hint: replicate the GAE formula from actor critc)
-        return None
+
+        rewards = torch.tensor(rewards)
+
+        # TODO: compute deltas: one-step TD errors
+        # 𝛿𝑡 = 𝑟𝑡 + 𝛾𝑉 𝜋(𝑠𝑡+1) − 𝑉 𝜋(𝑠𝑡)
+        deltas = rewards + self.gamma * next_values * (1 - dones) - values
+
+        # TODO: accumulate GAE advantages backwards
+        adv = torch.zeros_like(deltas)
+        gae = 0
+        for i in reversed(range(len(deltas))):
+            gae = deltas[i] + self.gamma * self.gae_lambda * (1 - dones[i]) * gae
+            adv[i] = gae
+
+        # TODO: compute returns using advantages and values
+        returns: torch.Tensor = adv + values
+
+        # TODO: normalize advantages to zero mean and unit variance and use 1e-8 for numerical stability
+        adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+
+        # TODO: advantages, returns  # replace with actual values (detach both to avoid re-entering the graph)
+
+        return adv.detach(), returns.detach()
 
     def update(self, trajectory: List[Any]) -> None:
         """
@@ -200,14 +226,15 @@ class PPOAgent(AbstractAgent):
         entropies = torch.stack([t[3] for t in trajectory]).detach()  # noqa: F841
         rewards = [t[4] for t in trajectory]  # noqa: F841
         dones = torch.tensor([t[5] for t in trajectory], dtype=torch.float32)  # noqa: F841
+        next_states = torch.stack([torch.from_numpy(t[6]).float() for t in trajectory])
 
         # TODO:  compute values and next_values without gradients
-        values = ...  # noqa: F841
-        next_values = ...  # noqa: F841
+        with torch.no_grad():
+            values = self.value_fn(states).squeeze()  # noqa: F841
+            next_values = self.value_fn(next_states).squeeze()  # noqa: F841
 
         # TODO: compute advantages and returns
-        advantages = ...
-        returns = ...
+        advantages, returns = self.compute_gae(rewards, values, next_values, dones)
 
         dataset = torch.utils.data.TensorDataset(
             states, actions, old_logps, advantages, returns
@@ -221,18 +248,26 @@ class PPOAgent(AbstractAgent):
                 # TODO: compute policy loss, value loss, and entropy loss
 
                 # TODO: compute new log probabilities by sampling actions from the policy distribution
-                new_logp = ...  # noqa: F841
+                dist = Categorical(self.policy(b_states))
+                new_logp = dist.log_prob(b_actions)  # noqa: F841
 
                 # TODO: compute the ratio of new log probabilities to old log probabilities
+                ratio = torch.exp(new_logp - b_oldlogp)
 
                 # TODO: compute the clipped surrogate loss using the clipped objective
-                policy_loss = ...
+                policy_loss = -torch.mean(
+                    torch.min(
+                        ratio * b_adv,
+                        torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * b_adv
+                    )
+                )
 
                 # TODO: compute value loss using mean squared error
-                value_loss = ...
+                new_values = self.value_fn(b_states)
+                value_loss = torch.mean((new_values - b_ret) ** 2)
 
                 # TODO: compute entropy loss using the distribution's entropy
-                entropy_loss = ...
+                entropy_loss = entropies.mean()
 
                 loss = (
                     policy_loss
@@ -331,7 +366,8 @@ class PPOAgent(AbstractAgent):
 
 @hydra.main(config_path="../configs/agent/", config_name="ppo", version_base="1.1")
 def main(cfg: DictConfig) -> None:
-    env = gym.make(cfg.env.name)
+    # env = gym.make(cfg.env.name)
+    env = gym.make(cfg.env.name, render_mode="human")
     set_seed(env, cfg.seed)
     agent = PPOAgent(
         env,
